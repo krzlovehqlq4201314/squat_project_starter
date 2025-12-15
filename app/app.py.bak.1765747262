@@ -1,0 +1,160 @@
+import os, io
+import numpy as np
+import pandas as pd
+import cv2
+from PIL import Image
+import streamlit as st
+import mediapipe as mp
+
+# ---------------- UI & i18n ----------------
+st.set_page_config(page_title="Squat Checker (MediaPipe)", layout="wide")
+
+LANGS = {
+    "zh": {
+        "title": "深蹲动作识别（MediaPipe 版）",
+        "lang": "语言",
+        "zh": "中文", "en": "English", "ko": "한국어",
+        "uploader": "单张图片上传（JPG/PNG）",
+        "pred": "预测：{label} | 置信度：{p:.2f}%",
+        "tip_good": "看起来动作不错，保持住！",
+        "tip_bad": "建议下蹲更深一点，膝盖方向对齐脚尖，并保持脊柱中立。",
+        "th": "判定为 squat 的阈值",
+        "feat": "动作指导",
+        "bar_title": "概率分布",
+        "no_pose": "没有检测到人体姿态，请换一张更清晰/完整的人像侧面图。"
+    },
+    "en": {
+        "title": "Squat Detector (MediaPipe)",
+        "lang": "Language",
+        "zh": "中文", "en": "English", "ko": "한국어",
+        "uploader": "Upload an image (JPG/PNG)",
+        "pred": "Prediction: {label} | Confidence: {p:.2f}%",
+        "tip_good": "Looks good! Keep the posture.",
+        "tip_bad": "Try to go deeper, track knees over toes, and keep a neutral spine.",
+        "th": "Threshold for classifying as squat",
+        "feat": "Coaching tip",
+        "bar_title": "Probabilities",
+        "no_pose": "No pose detected. Use a clearer side-view human image."
+    },
+    "ko": {
+        "title": "스쿼트 동작 감지 (MediaPipe)",
+        "lang": "언어",
+        "zh": "中文", "en": "English", "ko": "한국어",
+        "uploader": "이미지 업로드 (JPG/PNG)",
+        "pred": "예측: {label} | 신뢰도: {p:.2f}%",
+        "tip_good": "자세가 좋아 보여요. 유지하세요!",
+        "tip_bad": "조금 더 깊게 앉고, 무릎은 발끝 방향으로 유지하며, 척추 중립을 지키세요.",
+        "th": "스쿼트로 분류할 임계값",
+        "feat": "동작 코칭",
+        "bar_title": "확률 분포",
+        "no_pose": "포즈를 감지하지 못했습니다. 더 선명한 측면 전신 이미지를 사용하세요."
+    }
+}
+
+def T(key:str)->str:
+    lang = st.session_state.get("lang", "zh")
+    return LANGS.get(lang, LANGS["zh"]).get(key, key)
+
+with st.sidebar:
+    st.session_state["lang"] = st.radio(
+        T("lang"),
+        options=["zh","en","ko"],
+        format_func=lambda x: LANGS["zh" if x=="zh" else "en" if x=="en" else "ko"][x],
+        index={"zh":0,"en":1,"ko":2}[st.session_state.get("lang","zh")]
+    )
+    st.session_state["squat_threshold"] = st.slider(
+        T("th"), 0.30, 0.70, float(st.session_state.get("squat_threshold", 0.50)), 0.01
+    )
+
+st.title(T("title"))
+
+# ---------------- Pose helpers ----------------
+mp_pose = mp.solutions.pose
+POSE_LM = mp_pose.PoseLandmark
+
+def _angle(a, b, c):
+    """Angle at point b for triangle a-b-c (in degrees)."""
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    v1, v2 = a - b, c - b
+    cosang = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8)
+    cosang = np.clip(cosang, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosang)))
+
+def extract_features(img_bgr):
+    """Return (knee_angle_mean, hip_depth, squat_prob, had_pose)."""
+    with mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False) as pose:
+        result = pose.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+        if not result.pose_landmarks:
+            return 0.0, 0.0, 0.0, False
+
+        h, w = img_bgr.shape[:2]
+        lm = result.pose_landmarks.landmark
+
+        def xy(idx):
+            return (lm[idx].x, lm[idx].y)
+
+        # Left side
+        LHIP, LKNEE, LANK = xy(POSE_LM.LEFT_HIP), xy(POSE_LM.LEFT_KNEE), xy(POSE_LM.LEFT_ANKLE)
+        # Right side
+        RHIP, RKNEE, RANK = xy(POSE_LM.RIGHT_HIP), xy(POSE_LM.RIGHT_KNEE), xy(POSE_LM.RIGHT_ANKLE)
+
+        L_ang = _angle(LHIP, LKNEE, LANK) if all(lm[i].visibility>0.5 for i in [POSE_LM.LEFT_HIP,POSE_LM.LEFT_KNEE,POSE_LM.LEFT_ANKLE]) else np.nan
+        R_ang = _angle(RHIP, RKNEE, RANK) if all(lm[i].visibility>0.5 for i in [POSE_LM.RIGHT_HIP,POSE_LM.RIGHT_KNEE,POSE_LM.RIGHT_ANKLE]) else np.nan
+        knee_angle = np.nanmean([L_ang, R_ang])
+
+        # Depth (hip below knee => deeper). y 越大越靠下
+        L_depth = (LHIP[1] - LKNEE[1]) if not np.isnan(L_ang) else np.nan
+        R_depth = (RHIP[1] - RKNEE[1]) if not np.isnan(R_ang) else np.nan
+        hip_depth = np.nanmean([L_depth, R_depth])
+
+        # Map to score:
+        # 角度：160(站立)→0分, 100(较深)→1分
+        ang_feat = (160.0 - knee_angle) / 60.0
+        # 深度：hip_depth >= 0（髋低于/等于膝）更深，-0.15（髋明显高于膝）→0分, +0.15 → 1分
+        dep_feat = (hip_depth + 0.15) / 0.30
+
+        ang_feat = float(np.clip(ang_feat, 0.0, 1.0))
+        dep_feat = float(np.clip(dep_feat, 0.0, 1.0))
+        score = float(np.clip(0.6*ang_feat + 0.4*dep_feat, 0.0, 1.0))
+
+        return knee_angle, hip_depth, score, True
+
+# ---------------- UI main ----------------
+uploader = st.file_uploader(T("uploader"), type=["jpg","jpeg","png"])
+if uploader:
+    file_bytes = np.asarray(bytearray(uploader.read()), dtype=np.uint8)
+    bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if bgr is None:
+        st.error("Invalid image file.")
+    else:
+        st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), caption=f"已上传: {uploader.name}", use_column_width=True)
+
+        knee_angle, hip_depth, squat_score, ok = extract_features(bgr)
+        if not ok:
+            st.warning(T("no_pose"))
+        else:
+            th = float(st.session_state.get("squat_threshold", 0.5))
+            p_squat = squat_score
+            p_not   = 1.0 - p_squat
+            label = "squat" if p_squat >= th else "not_squat"
+            conf  = 100.0 * (p_squat if label=="squat" else p_not)
+
+            st.success(T("pred").format(label=label, p=conf))
+
+            st.subheader(T("feat"))
+            if label == "squat":
+                st.info(T("tip_good"))
+            else:
+                st.info(T("tip_bad"))
+
+            # bar
+            st.write(T("bar_title"))
+            df = pd.DataFrame({"class":["squat","not_squat"], "prob":[p_squat, p_not]})
+            st.bar_chart(df, x="class", y="prob")
+
+            # debug info
+            with st.expander("debug"):
+                st.write({"knee_angle": round(knee_angle,2), "hip_depth": round(hip_depth,4), "score": round(squat_score,4), "threshold": th})
+else:
+    st.caption(" ")
+

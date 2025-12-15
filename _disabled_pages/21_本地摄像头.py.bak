@@ -1,0 +1,171 @@
+import time
+import math
+from typing import List, Tuple
+
+import cv2
+import numpy as np
+import streamlit as st
+
+try:
+    from app.vis_utils import build_heatmap, colorize_heatmap, overlay_rgba_on_bgr, draw_skeleton_rgba
+except Exception:
+    from vis_utils import build_heatmap, colorize_heatmap, overlay_rgba_on_bgr, draw_skeleton_rgba
+
+import mediapipe as mp
+mp_pose = mp.solutions.pose
+
+# ---------- 几何与判定 ----------
+POSE_PAIRS: List[Tuple[int, int]] = [
+    (11,13),(13,15), (12,14),(14,16),
+    (11,12),
+    (23,24),
+    (23,25),(25,27),(29,31),
+    (24,26),(26,28),(30,32)
+]
+
+def angle_3p(a, b, c) -> float:
+    if a is None or b is None or c is None:
+        return float('nan')
+    v1 = np.array(a, dtype=np.float32) - np.array(b, dtype=np.float32)
+    v2 = np.array(c, dtype=np.float32) - np.array(b, dtype=np.float32)
+    if np.linalg.norm(v1) < 1e-6 or np.linalg.norm(v2) < 1e-6:
+        return float('nan')
+    cosang = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+    cosang = np.clip(cosang, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosang)))
+
+def knee_angles(pts):
+    def pick(i):
+        return None if i >= len(pts) or pts[i] is None else pts[i]
+    L = angle_3p(pick(23), pick(25), pick(27))
+    R = angle_3p(pick(24), pick(26), pick(28))
+    return L, R
+
+def classify_squat(left_knee: float, right_knee: float, th: float = 110.0):
+    margin = 15.0
+    min_k = np.nanmin([left_knee, right_knee])
+    if np.isnan(min_k):
+        return "unknown", 0.0, min_k
+    if min_k <= th:
+        conf = (th + margin - min_k) / margin
+        return "squat", float(np.clip(conf, 0, 1)), min_k
+    else:
+        conf = (min_k - th) / margin
+        return "not_squat", float(np.clip(conf, 0, 1)), min_k
+
+# ---------- UI ----------
+st.title("📷 本地摄像头 - Squat Checker")
+
+with st.sidebar:
+    st.header("参数")
+    cam_id = st.selectbox("摄像头ID", options=[0,1,2,3], index=0)
+    show_heat = st.checkbox("显示热力图", value=False)
+    show_skeleton = st.checkbox("显示关键线", value=True)
+    heat_alpha = st.slider("热力图/骨架 透明度", 0.0, 1.0, 0.45, 0.01)
+
+    width_choice = st.selectbox("分辨率宽", options=[640, 960, 1280], index=0)
+    max_fps = st.slider("最大FPS", 5, 30, 15, 1)
+
+    knee_th = st.slider("判定为 squat 的膝关节角度(°)", 80, 140, 110, 1)
+
+btn_run = st.button("▶ 开始", type="primary")
+btn_stop = st.button("■ 停止")
+
+if "run_cam" not in st.session_state:
+    st.session_state.run_cam = False
+
+if btn_run:
+    st.session_state.run_cam = True
+if btn_stop:
+    st.session_state.run_cam = False
+
+col_v, col_info = st.columns([4, 1.6], vertical_alignment="top")
+video_area = col_v.empty()
+info_md = col_info.empty()
+
+# ---------- 推理循环 ----------
+if st.session_state.run_cam:
+    cap = cv2.VideoCapture(cam_id, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width_choice)
+    cap.set(cv2.CAP_PROP_FPS, max_fps)
+
+    if not cap.isOpened():
+        st.error("无法打开摄像头")
+        st.session_state.run_cam = False
+    else:
+        with mp_pose.Pose(
+            static_image_mode=False,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        ) as pose:
+            last_t = time.time()
+            while st.session_state.run_cam and cap.isOpened():
+                ok, frame = cap.read()
+                if not ok:
+                    st.warning("读取画面失败")
+                    break
+
+                h, w = frame.shape[:2]
+                if w != width_choice:
+                    new_h = int(h * (width_choice / max(1, w)))
+                    frame = cv2.resize(frame, (width_choice, new_h), interpolation=cv2.INTER_LINEAR)
+                    h, w = frame.shape[:2]
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                res = pose.process(rgb)
+
+                pts_xy = [None] * 33
+                if res.pose_landmarks:
+                    for idx, lm in enumerate(res.pose_landmarks.landmark):
+                        x, y = int(lm.x * w), int(lm.y * h)
+                        if 0 <= x < w and 0 <= y < h:
+                            pts_xy[idx] = (x, y)
+
+                # 判定
+                l_knee, r_knee = knee_angles(pts_xy)
+                label, conf, _ = classify_squat(l_knee, r_knee, knee_th)
+
+                # 可视化
+                if show_skeleton and any(p is not None for p in pts_xy):
+                    rgba = draw_skeleton_rgba(frame, pts_xy, thickness=2)
+                    frame = overlay_rgba_on_bgr(frame, rgba, heat_alpha)  # 注意位置参数
+
+                if show_heat and any(p is not None for p in pts_xy):
+                    heat = build_heatmap(frame.shape[:2], pts_xy, sigma=14, intensity=1.0)
+                    heat_bgr = colorize_heatmap(heat)
+                    frame = cv2.addWeighted(frame, 1.0, heat_bgr, heat_alpha, 0)
+
+                # 结果文字
+                label_cn = "深蹲" if label == "squat" else ("非深蹲" if label == "not_squat" else "未知")
+                cv2.putText(frame, f"{label_cn}  conf: {conf:.2f}", (12, 28),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.9,
+                            (0, 180, 255) if label=="squat" else (0, 255, 0), 2)
+                if not np.isnan(l_knee):
+                    cv2.putText(frame, f"L-knee: {l_knee:.1f}", (12, 58),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+                if not np.isnan(r_knee):
+                    cv2.putText(frame, f"R-knee: {r_knee:.1f}", (12, 86),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2)
+
+                # 右栏
+                md = f"""
+**判定**：`{label}`（阈值 = {knee_th}°）  
+置信度：**{conf:.2f}**  
+
+- 左膝角：`{('%.1f°'%l_knee) if not np.isnan(l_knee) else '—'}`  
+- 右膝角：`{('%.1f°'%r_knee) if not np.isnan(r_knee) else '—'}`  
+"""
+                info_md.markdown(md)
+
+                video_area.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB),
+                                 channels="RGB", use_container_width=True)
+
+                now = time.time()
+                time.sleep(max(0.0, (1.0 / max_fps) - (now - last_t)))
+                last_t = time.time()
+
+        cap.release()
+else:
+    st.info("点击 **开始** 打开摄像头。可在侧边栏调节阈值、显示热力图/关键线、分辨率和 FPS。")

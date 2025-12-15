@@ -1,0 +1,2 @@
+# 占位文件：请勿在此导入 app.main 或执行 st.set_page_config
+# 任何页面都不要 from app.app import ... （避免副作用）

@@ -1,0 +1,11 @@
+import os, sys
+sys.path.append(os.path.dirname(__file__))
+from i18n import t, select_language
+import streamlit as st
+st.set_page_config(page_title="Squat Checker", layout="wide")
+
+from utils.i18n import t, select_language
+
+# 左侧语言切换
+st.title(f"🏠 {t('Home')}")
+st.write("在左侧选择：", t("Upload Page"), "或", t("Webcam"))

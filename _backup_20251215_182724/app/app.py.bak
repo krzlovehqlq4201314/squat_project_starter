@@ -1,0 +1,11 @@
+import streamlit as st
+from app.utils.i18n import t, language_selector
+
+# 只能在首页(主入口)调用一次
+st.set_page_config(page_title="Squat Checker", layout="wide", initial_sidebar_state="expanded")
+
+# 全局语言选择器
+language_selector()
+
+st.title(t("home_title") + " / Home")
+st.write(t("home_tip"))

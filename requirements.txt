@@ -1,0 +1,5 @@
+# Core runtime
+streamlit==1.37.1
+ultralytics==8.3.65
+opencv-contrib-python==4.10.0.84
+numpy<2

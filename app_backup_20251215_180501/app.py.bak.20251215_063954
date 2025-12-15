@@ -1,0 +1,247 @@
+import os, io
+import numpy as np
+import pandas as pd
+import cv2
+from PIL import Image
+import streamlit as st
+import mediapipe as mp
+import math
+
+st.set_page_config(page_title="Squat Checker (MediaPipe+Heatmap)", layout="wide")
+
+LANGS = {
+    "zh": {
+        "title": "深蹲动作识别（MediaPipe 版）",
+        "lang": "语言",
+        "zh": "中文", "en": "English", "ko": "한국어",
+        "uploader": "单张图片上传（JPG/PNG）",
+        "pred": "预测：{label} | 置信度：{p:.2f}%",
+        "tip_title": "动作指导",
+        "bar_title": "概率分布",
+        "no_pose": "没有检测到人体姿态，请换一张更清晰/完整的人像侧面图。",
+        "th": "判定为 squat 的阈值",
+        "show_heat": "显示热力图",
+        "show_lines": "显示关键线标注"
+    }
+}
+def T(k): return LANGS["zh"][k]
+
+with st.sidebar:
+    st.session_state["squat_threshold"] = st.slider(T("th"), 0.30, 0.70, float(st.session_state.get("squat_threshold", 0.45)), 0.01)
+    show_heat = st.checkbox(T("show_heat"), value=True)
+    show_lines = st.checkbox(T("show_lines"), value=True)
+
+st.title(T("title"))
+
+mp_pose = mp.solutions.pose
+POSE = mp_pose.PoseLandmark
+
+def _angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    v1, v2 = a - b, c - b
+    d = (np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-8
+    cosang = float(np.clip(np.dot(v1, v2) / d, -1.0, 1.0))
+    return float(np.degrees(np.arccos(cosang)))
+
+def _to_px(pt, W, H):
+    return int(pt[0]*W), int(pt[1]*H)
+
+def gaussian_heatmap(H, W, centers, sigma, weights):
+    heat = np.zeros((H, W), dtype=np.float32)
+    S = max(3, int(3*sigma))
+    for (x, y), w in zip(centers, weights):
+        if np.isnan(x) or np.isnan(y): continue
+        cx, cy = int(x*W), int(y*H)
+        x0, x1 = max(0, cx-S), min(W, cx+S+1)
+        y0, y1 = max(0, cy-S), min(H, cy+S+1)
+        if x1<=x0 or y1<=y0: continue
+        xs = np.arange(x0, x1) - cx
+        ys = np.arange(y0, y1) - cy
+        gx = np.exp(-(xs**2)/(2*sigma**2))
+        gy = np.exp(-(ys**2)/(2*sigma**2))
+        g = np.outer(gy, gx) * float(w)
+        heat[y0:y1, x0:x1] = np.maximum(heat[y0:y1, x0:x1], g)
+    if heat.max() > 0: heat = (255 * (heat/heat.max())).astype(np.uint8)
+    return heat
+
+def in_range(val, lo, hi): return lo <= val <= hi
+
+def extract_and_score(img_bgr):
+    H, W = img_bgr.shape[:2]
+    with mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False) as pose:
+        res = pose.process(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
+    if not res.pose_landmarks: return None
+
+    lm = res.pose_landmarks.landmark
+    def xy(idx): return (lm[idx].x, lm[idx].y)
+    vis_ok = lambda idxs: all(lm[i].visibility>0.5 for i in idxs)
+
+    # 左/右 髋膝踝
+    L = [POSE.LEFT_HIP, POSE.LEFT_KNEE, POSE.LEFT_ANKLE]
+    R = [POSE.RIGHT_HIP, POSE.RIGHT_KNEE, POSE.RIGHT_ANKLE]
+    L_pts = list(map(xy, L)); R_pts = list(map(xy, R))
+
+    L_ang = _angle(*L_pts) if vis_ok(L) else np.nan
+    R_ang = _angle(*R_pts) if vis_ok(R) else np.nan
+    knee_angle = float(np.nanmean([L_ang, R_ang]))
+
+    # 髋-膝相对高度 (y大=更靠下；髋-膝>0 表示髋不高于膝，越大越深)
+    L_depth = (L_pts[0][1] - L_pts[1][1]) if not np.isnan(L_ang) else np.nan
+    R_depth = (R_pts[0][1] - R_pts[1][1]) if not np.isnan(R_ang) else np.nan
+    hip_depth = float(np.nanmean([L_depth, R_depth]))
+
+    # 膝内扣/外翻（膝相对髋-踝的横向偏移）
+    def lateral_deviation(hip, knee, ankle):
+        xh, xk, xa = hip[0], knee[0], ankle[0]
+        mid = (xh + xa)/2.0
+        return xk - mid  # <0 偏内扣, >0 外翻
+    latL = lateral_deviation(*L_pts) if vis_ok(L) else np.nan
+    latR = lateral_deviation(*R_pts) if vis_ok(R) else np.nan
+    lat_dev = float(np.nanmean([latL, latR]))
+
+    # 躯干前倾（肩-髋 竖直差占身高比例）
+    SH = [POSE.LEFT_SHOULDER, POSE.RIGHT_SHOULDER]
+    shoulders = list(map(xy, SH))
+    if all(lm[i].visibility>0.5 for i in SH+ [POSE.LEFT_HIP, POSE.RIGHT_HIP]):
+        sh_y = np.mean([p[1] for p in shoulders])
+        hip_y = np.mean([xy(POSE.LEFT_HIP)[1], xy(POSE.RIGHT_HIP)[1]])
+        torso_lean = abs(sh_y - hip_y)  # 越大，前倾越明显（粗略）
+    else:
+        torso_lean = np.nan
+
+    # 评分：逻辑回归（经验参数）
+    # z = a*(135 - knee_angle) + b*(hip_depth_scaled)
+    z = 0.08*(135.0 - knee_angle) + 4.0*(hip_depth)  # hip_depth ~ [-0.1, +0.2]
+    p_squat = float(1.0/(1.0 + math.exp(-z)))
+    p_squat = float(np.clip(p_squat, 0.0, 1.0))
+    p_not = 1.0 - p_squat
+
+    # 对应热力图权重：问题越大，越红
+    knee_err = float(np.clip((knee_angle - 130.0)/25.0, 0.0, 1.0))   # >130 越直越红
+    depth_err = float(np.clip((0.02 - hip_depth)/0.08, 0.0, 1.0))   # 髋没到膝（<0.02）越红
+    lat_err = float(np.clip(abs(lat_dev)/0.06, 0.0, 1.0))           # 膝内扣/外翻
+    lean_err = 0.0 if np.isnan(torso_lean) else float(np.clip((torso_lean - 0.10)/0.12, 0.0, 1.0))
+
+    centers = []
+    weights = []
+    if vis_ok(L):
+        centers += [L_pts[0], L_pts[1], L_pts[2]]
+        weights += [depth_err, knee_err, 0.3*lat_err]
+    if vis_ok(R):
+        centers += [R_pts[0], R_pts[1], R_pts[2]]
+        weights += [depth_err, knee_err, 0.3*lat_err]
+
+    # 关键线颜色：达标绿、警示黄、问题红
+    def level_color(ok): return (0,200,0) if ok else (0,165,255)
+    depth_ok = hip_depth >= 0.02
+    angle_ok = knee_angle <= 140.0
+    lat_ok = abs(lat_dev) <= 0.03
+
+    vis = {
+        "knee_angle": knee_angle,
+        "hip_depth": hip_depth,
+        "lat_dev": lat_dev,
+        "torso_lean": torso_lean,
+        "depth_ok": depth_ok,
+        "angle_ok": angle_ok,
+        "lat_ok": lat_ok
+    }
+
+    return {
+        "p_squat": p_squat, "p_not": p_not,
+        "centers": centers, "weights": weights,
+        "knee_angle": knee_angle, "hip_depth": hip_depth,
+        "lat_dev": lat_dev, "torso_lean": torso_lean,
+        "flags": vis,
+        "landmarks": res.pose_landmarks
+    }
+
+def draw_overlays(img_bgr, info, show_heat=True, show_lines=True):
+    out = img_bgr.copy()
+    H, W = out.shape[:2]
+
+    if show_heat and len(info["centers"])>0:
+        heat = gaussian_heatmap(H, W, info["centers"], sigma=int(0.03*min(W,H)), weights=info["weights"])
+        if heat.max()>0:
+            heat_c = cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+            out = cv2.addWeighted(out, 0.7, heat_c, 0.6, 0)
+
+    if show_lines and info["landmarks"]:
+        lm = info["landmarks"].landmark
+        def px(i): return _to_px((lm[i].x, lm[i].y), W, H)
+        pairs = [
+            (POSE.LEFT_HIP, POSE.LEFT_KNEE),
+            (POSE.LEFT_KNEE, POSE.LEFT_ANKLE),
+            (POSE.RIGHT_HIP, POSE.RIGHT_KNEE),
+            (POSE.RIGHT_KNEE, POSE.RIGHT_ANKLE),
+        ]
+        # 颜色按是否达标
+        c_depth = (0,200,0) if info["flags"]["depth_ok"] else (36,36,255)
+        c_angle = (0,200,0) if info["flags"]["angle_ok"] else (0,165,255)
+        c_lat   = (0,200,0) if info["flags"]["lat_ok"]   else (0,140,255)
+
+        for a,b in pairs:
+            pa, pb = px(a), px(b)
+            color = c_angle if POSE._value2member_map_[a].name.endswith("KNEE") or POSE._value2member_map_[b].name.endswith("KNEE") else c_depth
+            cv2.line(out, pa, pb, color, 4, cv2.LINE_AA)
+            cv2.circle(out, pa, 4, (255,255,255), -1, cv2.LINE_AA)
+            cv2.circle(out, pb, 4, (255,255,255), -1, cv2.LINE_AA)
+
+        # 膝的横向对齐辅助线
+        for side in ["LEFT","RIGHT"]:
+            hip = getattr(POSE, f"{side}_HIP")
+            knee = getattr(POSE, f"{side}_KNEE")
+            ankle = getattr(POSE, f"{side}_ANKLE")
+            if lm[hip].visibility>0.5 and lm[knee].visibility>0.5 and lm[ankle].visibility>0.5:
+                ph, pk, pa = px(hip), px(knee), px(ankle)
+                mid = ((ph[0]+pa[0])//2, (ph[1]+pa[1])//2)
+                cv2.line(out, ph, pa, c_lat, 2, cv2.LINE_AA)
+                cv2.circle(out, pk, 6, c_lat, 2, cv2.LINE_AA)
+
+    return out
+
+uploader = st.file_uploader(T("uploader"), type=["jpg","jpeg","png"])
+if uploader:
+    file_bytes = np.asarray(bytearray(uploader.read()), dtype=np.uint8)
+    bgr = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    if bgr is None:
+        st.error("Invalid image file.")
+    else:
+        info = extract_and_score(bgr)
+        st.image(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), caption=f"已上传: {uploader.name}", use_column_width=True)
+        if info is None:
+            st.warning(T("no_pose"))
+        else:
+            th = float(st.session_state.get("squat_threshold", 0.45))
+            p_squat, p_not = info["p_squat"], info["p_not"]
+            label = "squat" if p_squat >= th else "not_squat"
+            conf = 100.0 * (p_squat if label=="squat" else p_not)
+            st.success(T("pred").format(label=label, p=conf))
+
+            # 概率条
+            st.write(T("bar_title"))
+            df = pd.DataFrame({"class":["squat","not_squat"], "prob":[p_squat, p_not]})
+            st.bar_chart(df, x="class", y="prob", use_container_width=True)
+
+            # 动作指导
+            st.subheader(T("tip_title"))
+            tips = []
+            if not info["flags"]["depth_ok"]:
+                tips.append("· 再深一点：目标是髋部至少与膝同高（或略低）。")
+            if not info["flags"]["angle_ok"]:
+                tips.append("· 膝角再小一点（弯曲更充分），避免半蹲停在高位。")
+            if not info["flags"]["lat_ok"]:
+                d = info["lat_dev"]
+                tips.append("· 膝盖朝脚尖方向，避免{}扣。".format("内" if d<0 else "外"))
+            if (not np.isnan(info["torso_lean"])) and info["torso_lean"]>0.22:
+                tips.append("· 躯干前倾偏大，收紧核心，保持脊柱中立。")
+            if not tips:
+                tips = ["· 看起来动作不错，保持住！"]
+            for t in tips: st.info(t)
+
+            # 叠加显示
+            vis_img = draw_overlays(bgr, info, show_heat=show_heat, show_lines=show_lines)
+            st.image(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB), caption="可视化（热力图/连线）", use_column_width=True)
+
+else:
+    st.caption(" ")

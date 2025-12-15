@@ -1,0 +1,20 @@
+# venv
+.venv*/
+.venv*/
+.venv311/
+# python
+__pycache__/
+*.pyc
+# streamlit
+.streamlit/secrets.toml
+# models & weights
+models/*.pt
+models/*.onnx
+checkpoints/
+# data
+data/*
+!data/README.md
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/

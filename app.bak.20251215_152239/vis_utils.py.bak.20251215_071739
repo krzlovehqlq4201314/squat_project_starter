@@ -1,0 +1,58 @@
+import numpy as np
+import cv2
+
+# 常用骨架连线（MediaPipe Pose 索引）
+POSE_PAIRS = [
+    (11,13),(13,15),(12,14),(14,16),  # 手臂
+    (11,12),                          # 肩
+    (23,24),(11,23),(12,24),          # 躯干
+    (23,25),(25,27),(27,29),(29,31),  # 左腿
+    (24,26),(26,28),(28,30),(30,32),  # 右腿
+]
+
+def build_heatmap(img_shape, points_xy, sigma=16, intensity=1.0):
+    """仅生成热力图（BGR）"""
+    H, W = img_shape[:2]
+    heat = np.zeros((H, W), np.float32)
+    for p in points_xy:
+        if p is None: 
+            continue
+        x, y = p
+        if x is None or y is None or x < 0 or y < 0 or x >= W or y >= H:
+            continue
+        xs = np.arange(W, dtype=np.float32) - x
+        ys = np.arange(H, dtype=np.float32) - y
+        g = np.exp(-0.5 * (np.outer(ys**2, np.ones(W)) + np.outer(np.ones(H), xs**2)) / (sigma**2))
+        heat = np.maximum(heat, g)
+    heat = (np.clip(heat, 0, 1) * 255 * intensity).astype(np.uint8)
+    return cv2.applyColorMap(heat, cv2.COLORMAP_JET)
+
+def draw_skeleton_rgba(img_shape, points_xy, pairs=POSE_PAIRS, thickness=3):
+    """只画关键线与点，输出 RGBA，便于 Alpha 叠加或单独显示"""
+    H, W = img_shape[:2]
+    canvas = np.zeros((H, W, 4), np.uint8)
+    # 线
+    for (i, j) in pairs:
+        if i >= len(points_xy) or j >= len(points_xy):
+            continue
+        p1, p2 = points_xy[i], points_xy[j]
+        if p1 is None or p2 is None:
+            continue
+        x1, y1 = map(int, p1); x2, y2 = map(int, p2)
+        if min(x1, y1, x2, y2) < 0:
+            continue
+        cv2.line(canvas, (x1, y1), (x2, y2), (0,255,0,255), thickness, cv2.LINE_AA)
+    # 点
+    for p in points_xy:
+        if p is None: 
+            continue
+        x, y = map(int, p)
+        if x < 0 or y < 0:
+            continue
+        cv2.circle(canvas, (x, y), 4, (255,255,255,255), -1, cv2.LINE_AA)
+    return canvas
+
+def overlay_rgba_on_bgr(bgr, rgba):
+    """把 RGBA 覆盖到 BGR（Alpha 混合）"""
+    a = rgba[:,:,3:4].astype(np.float32) / 255.0
+    return (bgr.astype(np.float32) * (1 - a) + rgba[:,:,:3].astype(np.float32) * a).astype(np.uint8)

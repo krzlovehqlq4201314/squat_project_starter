@@ -1,0 +1,80 @@
+import numpy as np
+import cv2
+
+POSE_PAIRS = [
+    (11,13),(13,15),(14,16),(12,14),
+    (11,12),
+    (23,24),
+    (23,25),(25,27),(27,29),(29,31),
+    (24,26),(26,28),(28,30),(30,32)
+]
+
+def to_bgr_u8(img):
+    if img is None:
+        raise ValueError("img is None")
+    arr = np.asarray(img)
+    if arr.ndim == 2:
+        pass
+    elif arr.ndim == 3:
+        if arr.shape[2] == 4:
+            arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+        elif arr.shape[2] == 3:
+            # 尽量统一为 BGR
+            try:
+                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            except Exception:
+                arr = np.ascontiguousarray(arr)
+        else:
+            raise ValueError(f"Unsupported channels: {arr.shape}")
+    else:
+        raise ValueError(f"Unsupported shape: {arr.shape}")
+    arr = arr.astype(np.uint8, copy=False)
+    if not arr.flags['C_CONTIGUOUS']:
+        arr = np.ascontiguousarray(arr)
+    return arr
+
+def draw_skeleton_rgba(frame_size, pts, color=(0, 255, 0, 255), thickness=2):
+    H, W = frame_size
+    rgba = np.zeros((H, W, 4), np.uint8)
+    for a, b in POSE_PAIRS:
+        xa, ya, sa = pts[a]
+        xb, yb, sb = pts[b]
+        if sa > 0.5 and sb > 0.5:
+            pa = (int(xa), int(ya))
+            pb = (int(xb), int(yb))
+            cv2.line(rgba, pa, pb, color, thickness, lineType=cv2.LINE_AA)
+    return rgba
+
+def overlay_rgba_on_bgr(bgr, rgba, alpha_scale=1.0):
+    bgr = to_bgr_u8(bgr)
+    H, W = bgr.shape[:2]
+    if rgba.shape[:2] != (H, W):
+        rgba = cv2.resize(rgba, (W, H), interpolation=cv2.INTER_LINEAR)
+    if not rgba.flags['C_CONTIGUOUS']:
+        rgba = np.ascontiguousarray(rgba)
+    rgb = rgba[:, :, :3].astype(np.float32)
+    a = (rgba[:, :, 3:4].astype(np.float32) / 255.0) * float(alpha_scale)
+    rgb_bgr = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2BGR).astype(np.float32)
+    base = bgr.astype(np.float32)
+    out = (base * (1.0 - a) + rgb_bgr * a).clip(0, 255).astype(np.uint8)
+    return out
+
+def colorize_heatmap(heat, colormap=None):
+    if heat.dtype != np.uint8:
+        h = cv2.normalize(heat, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    else:
+        h = heat
+    if colormap is None:
+        colormap = cv2.COLORMAP_TURBO
+    color = cv2.applyColorMap(h, colormap)
+    if not color.flags['C_CONTIGUOUS']:
+        color = np.ascontiguousarray(color)
+    return color
+
+def overlay_heatmap_on_bgr(bgr, heat_bgr, alpha=0.45):
+    bgr = to_bgr_u8(bgr)
+    H, W = bgr.shape[:2]
+    if heat_bgr.shape[:2] != (H, W):
+        heat_bgr = cv2.resize(heat_bgr, (W, H), interpolation=cv2.INTER_LINEAR)
+    out = cv2.addWeighted(bgr, 1.0 - alpha, heat_bgr, alpha, 0.0)
+    return out

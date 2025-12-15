@@ -1,0 +1,370 @@
+# -*- coding: utf-8 -*-
+import numpy as np, pandas as pd, altair as alt
+import streamlit as st
+from PIL import Image
+from pathlib import Path
+
+st.set_page_config(page_title="Squat Inspector", layout="wide")
+st.title("Squat Inspector")
+
+MODEL_DIR = Path("models")
+ONNX_PATH = MODEL_DIR / "squat.onnx"
+TORCH_PATH = MODEL_DIR / "squat_cls_resnet18.pt"
+CLSTXT     = MODEL_DIR / "classes.txt"
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+def read_classes(default_nc=2):
+    if CLSTXT.exists():
+        xs = [x.strip() for x in CLSTXT.read_text(encoding="utf-8").splitlines() if x.strip()]
+        if xs: return xs
+    return (["correct","incorrect","not_squat"] if default_nc==3 else ["not_squat","squat"])
+
+def preprocess_pil(image_pil, size=224):
+    im = image_pil.copy().convert("RGB")
+    w, h = im.size
+    s = size / min(w, h)
+    im = im.resize((int(w*s), int(h*s)))
+    w2, h2 = im.size
+    l = (w2 - size)//2; t = (h2 - size)//2
+    im = im.crop((l, t, l+size, t+size))
+    arr = np.asarray(im).astype(np.float32)/255.0
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    arr = arr.transpose(2,0,1)[None,...]  # NCHW
+    return arr
+
+def softmax(x):
+    x = x - x.max(axis=1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=1, keepdims=True)
+
+@st.cache_resource
+def load_infer():
+    # 1) ONNX
+    if ONNX_PATH.exists():
+        import onnxruntime as ort
+        sess = ort.InferenceSession(str(ONNX_PATH), providers=["CPUExecutionProvider"])
+        in0 = sess.get_inputs()[0]
+        in_name = in0.name
+        ishape = list(in0.shape)
+        is_nhwc = (len(ishape)==4 and ishape[-1]==3)
+        # 猜 num_classes
+        out0 = sess.get_outputs()[0]
+        nc = None
+        if isinstance(out0.shape, (list,tuple)) and isinstance(out0.shape[-1], int):
+            nc = int(out0.shape[-1])
+        classes = read_classes(nc or 2)
+        def infer_fn(img_pil):
+            x = preprocess_pil(img_pil)
+            if is_nhwc: x = x.transpose(0,2,3,1)
+            logits = sess.run(None, {in_name: x.astype("float32")})[0]
+            probs = softmax(logits)[0]
+            return probs, classes
+        return "onnx", infer_fn
+
+    # 2) Torch fallback
+    try:
+        import torch
+        from torchvision import models
+        if TORCH_PATH.exists():
+            m = models.resnet18()
+            m.fc = torch.nn.Linear(m.fc.in_features, 2)
+            sd = torch.load(TORCH_PATH, map_location="cpu")
+            m.load_state_dict(sd if isinstance(sd, dict) else sd["model"], strict=False)
+            m.eval()
+            classes = read_classes(2)
+            def infer_fn(img_pil):
+                x = preprocess_pil(img_pil)
+                x = torch.from_numpy(x)
+                with torch.no_grad():
+                    logits = m(x).numpy()
+                probs = softmax(logits)[0]
+                return probs, classes
+            return "torch", infer_fn
+    except Exception as e:
+        print("Torch fallback disabled:", e)
+
+    # 3) Demo 兜底
+    classes = read_classes(2)
+    def demo_infer(img_pil):
+        arr = np.asarray(img_pil.convert("RGB")).astype(np.float32)/255.0
+        br = float(arr.mean())
+        return np.array([1.0 - br, br], dtype=np.float32), classes
+    return "demo", demo_infer
+
+engine, infer = load_infer()
+st.caption(f"Engine: **{engine}** | ONNX: {'OK' if ONNX_PATH.exists() else 'missing'}")
+
+up = st.file_uploader("上传一张图片(JPG/PNG)", type=["jpg","jpeg","png"], key="upload_main")
+if not up:
+    st.info("请先上传图片.")
+    st.stop()
+
+im = Image.open(up).convert("RGB")
+st.image(im, caption=up.name, use_column_width=True)
+
+probs, classes = infer(im)
+idx = int(np.argmax(probs))
+conf = float(probs[idx])
+st.success(f"{T('prediction')}:**{classes[idx]}** ｜ {T('confidence')}:{conf:.2%}")
+
+df = pd.DataFrame({"class": classes, "prob": probs})
+st.altair_chart(
+    alt.Chart(df).mark_bar().encode(
+        x=alt.X("class:N", sort=None, title=T("class")),
+        y=alt.Y("prob:Q", title=T("prob"), scale=alt.Scale(domain=[0,1])),
+        tooltip=["class","prob"]
+    ).properties(height=220),
+
+)
+# === Guidance block (auto-inserted / multi-lang) ===
+# 侧边栏语言选择(中文 / English / 한국어),会保存在会话状态
+_lang_display2code = {"中文":"zh", "English":"en", "한국어":"ko"}
+_code2lang_display = {"zh":"中文", "en":"English", "ko":"한국어"}
+try:
+    import streamlit as st  # 若前面已导入,这里不会报错
+# >>> I18N BEGIN (auto-inserted)
+"""
+Translator: T("key") -> text for current UI language; fallback to key.
+This block must only contain ASCII characters (no smart quotes).
+"""
+LANG_TEXTS = {
+    "en": {
+        "app_title": "Squat Inspector (Minimal)",
+        "upload_label": "Upload Image (JPG/PNG)",
+        "limit": "Limit 200MB per file · JPG, JPEG, PNG",
+        "prediction": "Prediction",
+        "confidence": "Confidence",
+        "tip_good": "Looks like a good squat! Keep it up.",
+        "tip_bad_title": "Guidance",
+        "tip_bad_body": "Try to sit slightly deeper, keep your knees tracking over toes, and maintain a neutral spine.",
+        "lang_label": "Language",
+        "lang_en": "English",
+        "lang_zh": "中文",
+        "lang_ko": "한국어",
+    },
+    "zh": {
+        "app_title": "深蹲识别（最小可运行版）",
+        "upload_label": "上传图片（JPG/PNG）",
+        "limit": "单文件上限 200MB · 支持 JPG、JPEG、PNG",
+        "prediction": "预测",
+        "confidence": "置信度",
+        "tip_good": "看起来动作不错，保持住！",
+        "tip_bad_title": "动作指导",
+        "tip_bad_body": "建议下蹲更深一点，膝盖方向对齐脚尖，并保持脊柱中立。",
+        "lang_label": "语言",
+        "lang_en": "English",
+        "lang_zh": "中文",
+        "lang_ko": "한국어",
+    },
+    "ko": {
+        "app_title": "스쿼트 인스펙터 (미니멀)",
+        "upload_label": "이미지 업로드 (JPG/PNG)",
+        "limit": "파일당 200MB 제한 · JPG, JPEG, PNG 지원",
+        "prediction": "예측",
+        "confidence": "신뢰도",
+        "tip_good": "자세가 좋아 보입니다. 계속 유지하세요!",
+        "tip_bad_title": "자세 가이드",
+        "tip_bad_body": "조금 더 깊게 앉고, 무릎은 발끝 방향으로 정렬하며, 척추 중립을 유지하세요.",
+        "lang_label": "언어",
+        "lang_en": "English",
+        "lang_zh": "中文",
+        "lang_ko": "한국어",
+    },
+}
+def T(key, lang=None):
+    """Return translated text for current language; fallback to key."""
+    import streamlit as st
+    if lang is None:
+        lang = st.session_state.get("lang", "zh")
+    return LANG_TEXTS.get(lang, {}).get(key, key)
+
+# initial session lang
+import streamlit as st
+if "lang" not in st.session_state:
+    st.session_state["lang"] = "zh"
+
+# sidebar language selector (at page load)
+_lang_display = {
+    "en": LANG_TEXTS["en"]["lang_en"],
+    "zh": LANG_TEXTS["zh"]["lang_zh"],
+    "ko": LANG_TEXTS["ko"]["lang_ko"],
+}
+_lang_order = ["zh","en","ko"]
+_idx = _lang_order.index(st.session_state["lang"])
+_sel = st.sidebar.radio(
+    label=LANG_TEXTS[st.session_state["lang"]]["lang_label"],
+    options=[_lang_display[c] for c in _lang_order],
+    index=_idx,
+)
+for _code in _lang_order:
+    if _lang_display[_code] == _sel:
+        st.session_state["lang"] = _code
+        break
+# >>> I18N END
+
+except Exception:
+    pass
+
+if "ui_lang" not in st.session_state:
+    st.session_state.ui_lang = "zh"
+_choice = st.sidebar.radio(
+    "Language / 语言 / 언어",
+    list(_lang_display2code.keys()),
+    index=list(_lang_display2code.keys()).index(_code2lang_display.get(st.session_state.ui_lang, "中文"))
+)
+st.session_state.ui_lang = _lang_display2code[_choice]
+_LANG = st.session_state.ui_lang
+
+# 多语言文案
+_GUIDE = {
+    "zh": {
+        "title": "动作指导(检测到非标准深蹲)",
+        "ok": "判定为 **squat** ✅ 继续保持:核心张力,膝盖与脚尖同向,脚掌三点受力,髋主导下蹲.",
+        "md": """
+**常见问题 → 修正要点**
+- **脚跟离地** → 重心后移,脚掌"**三点受力**"(大脚趾根,小趾根,脚跟)扎地.  
+- **膝盖内扣** → 想象把地面"拨开",让**膝盖与脚尖同向**(起身也保持).  
+- **塌腰/弓背** → 提胸,**收紧核心**,背部保持中立位.  
+- **只屈膝不屈髋** → "**屁股向后坐**",髋主导下蹲,膝不过度前移.  
+- **深度不足** → 目标:髋部与膝平或略低;**全程可控**,膝不夹.  
+- **起身挤膝** → 继续向外推膝,**脚跟发力**,呼气站起.  
+
+**纠正练习(每次 2–3 组)**
+1. **箱式深蹲(Box Squat)**:坐到箱子/凳子再站起,建立正确路径;  
+2. **墙前深蹲**:距离墙 20–30 cm,下蹲避免膝盖/躯干撞墙;  
+3. **弹力带开合/侧步走**:加强**臀中肌**,稳定膝盖;  
+4. **踝背屈灵活性**:小腿前跨,跟腱拉伸,提升踝活动度.  
+
+**关键口令(自检)**:脚掌抓地｜膝盖对脚尖｜屁股向后坐｜核心顶住｜匀速上下.
+        """
+    },
+    "en": {
+        "title": "Form Guidance (Non-standard Squat Detected)",
+        "ok": "Predicted **squat** ✅ Great! Keep: core braced, knees track toes, tripod foot, hip-dominant descent.",
+        "md": """
+**Common faults → Fixes**
+- **Heels lift** → Shift weight back; keep **tripod foot** (big toe, little toe, heel) gripping the floor.  
+- **Knees cave in** → "Spread the floor"; keep **knees tracking toes** (also on the way up).  
+- **Rounding/overextension** → Chest up, **brace the core**, maintain neutral spine.  
+- **Knee-dominant** → "**Hips back**", hip-dominant squat, avoid excessive forward knee travel.  
+- **Shallow depth** → Aim for hip crease at/just below knee; **controlled** through full ROM.  
+- **Knee collision on ascent** → Keep pushing knees out, **drive through heels**, exhale up.  
+
+**Corrective drills (2–3 sets each)**
+1. **Box squat** – touch box/bench then stand; engrain correct path.  
+2. **Wall squat** – 20–30 cm from wall; avoid knees/torso hitting wall.  
+3. **Band walks/clam shells** – strengthen **glute med** to stabilize knees.  
+4. **Ankle dorsiflexion work** – knee-to-wall, calf stretch, improve ankle mobility.  
+
+**Cues**: Tripod foot｜Knees out｜Hips back｜Brace｜Smooth tempo.
+        """
+    },
+    "ko": {
+        "title": "동작 가이드(비표준 스쿼트 감지)",
+        "ok": "예측 **squat** ✅ 아주 좋아요! 코어 긴장, 무릎은 발끝 방향, 삼점 지지, 힙 주도 하강을 유지하세요.",
+        "md": """
+**자주 나오는 문제 → 교정 포인트**
+- **뒤꿈치가 뜸** → 체중을 뒤로, **삼점 지지**(엄지발가락, 새끼발가락, 뒤꿈치)로 바닥을 꽉.  
+- **무릎이 안쪽으로 모임** → 바닥을 '벌린다'는 느낌, **무릎은 발끝과 동일 방향**(상승 시도 유지).  
+- **허리 말림/과신전** → 가슴을 펴고 **코어 긴장**, 중립 척추 유지.  
+- **무릎만 굽힘** → "**엉덩이를 뒤로**", 힙 주도 스쿼트, 무릎의 과도한 전방 이동 방지.  
+- **깊이가 부족** → 고관절이 무릎선과 같거나 약간 아래까지, **전 구간 제어**.  
+- **올라올 때 무릎이 모임** → 계속 바깥으로 밀고, **뒤꿈치로 밀어** 일어남, 내쉬면서 상승.  
+
+**교정 드릴(각 2–3세트)**
+1. **박스 스쿼트** – 박스/벤치에 가볍게 닿고 일어나기, 올바른 경로 학습.  
+2. **벽 스쿼트** – 벽에서 20–30 cm, 무릎/상체가 벽에 닿지 않도록.  
+3. **밴드 사이드 워크/클램셸** – **중둔근** 강화로 무릎 안정.  
+4. **발목 가동성** – 무릎-벽 테스트, 종아리 스트레칭 등.  
+
+**키 큐**: 삼점 지지｜무릎 바깥｜엉덩이 뒤로｜코어 버티기｜부드러운 템포.
+        """
+    }
+}
+
+# 读取当前T("prediction")结果(兼容 list / numpy)
+try:
+    import numpy as _np
+    _idx = int(_np.asarray(probs).argmax())
+except Exception:
+    try:
+        _idx = int(list(probs).index(max(probs)))
+    except Exception:
+        _idx = 0
+
+try:
+    _pred_label = str(classes[_idx])
+except Exception:
+    try:
+        _pred_label = str(list(classes)[_idx])
+    except Exception:
+        _pred_label = "unknown"
+
+# 展示指导
+if _pred_label == "not_squat":
+    with st.expander(_GUIDE[_LANG]["title"], expanded=True):
+        st.markdown(_GUIDE[_LANG]["md"])
+else:
+    st.info(_GUIDE[_LANG]["ok"])
+# === End Guidance block ===
+
+# === i18n (auto-inserted, global) ===
+import streamlit as st
+
+# 语言 -> 文案表
+I18N = {
+    "zh": {
+        "page_title": "Squat Inspector",
+        "lang_label": "语言",
+        "upload_title": T("upload_title"),
+        "drag": "拖拽或点击上传",
+        "limit": f: {T(""")}limit: ,
+        "uploaded": "已上传",
+        "prediction": f: {T(""")}prediction: ,
+        "confidence": f: {T(""")}confidence: ,
+        "class": "类别",
+        "prob": "概率"
+    },
+    "en": {
+        "page_title": "Squat Inspector",
+        "lang_label": "Language",
+        "upload_title": T("upload_title"),
+        "drag": f: {T(""")}drag: ,
+        "limit": f: {T(""")}limit: ,
+        "uploaded": "Uploaded",
+        "prediction": "Prediction",
+        "confidence": "Confidence",
+        "class": "class",
+        "prob": "prob"
+    },
+    "ko": {
+        "page_title": "스쿼트 검사기",
+        "lang_label": "언어",
+        "upload_title": "이미지 업로드 (JPG/PNG)",
+        "drag": "드래그하거나 클릭하여 업로드",
+        "limit": "파일당 200MB 제한 · JPG, JPEG, PNG",
+        "uploaded": "업로드됨",
+        "prediction": "예측",
+        "confidence": "신뢰도",
+        "class": "클래스",
+        "prob": "확률"
+    }
+}
+
+# 侧边栏优先呈现的语言选择(进入页面即出现)
+_display2code = {"中文":"zh", "English":"en", "한국어":"ko"}
+_code2display = {v:k for k,v in _display2code.items()}
+if "ui_lang" not in st.session_state:
+    st.session_state.ui_lang = "zh"
+_lang_choice = st.sidebar.radio(
+    label=I18N[st.session_state.ui_lang]["lang_label"] if st.session_state.ui_lang in I18N else "Language",
+    options=list(_display2code.keys()),
+    index=list(_display2code.keys()).index(_code2display.get(st.session_state.ui_lang,"中文"))
+)
+st.session_state.ui_lang = _display2code[_lang_choice]
+LANG = st.session_state.ui_lang
+
+def T(key:str):
+    """Translator: T("key") -> text for current UI language; fallback to key."""

@@ -1,0 +1,116 @@
+import time, math
+import cv2, numpy as np, streamlit as st, mediapipe as mp
+from vis_utils import build_heatmap, draw_skeleton_rgba, overlay_rgba_on_bgr
+
+st.set_page_config(page_title="📷 本地摄像头 - Squat Checker", layout="wide")
+st.title("📷 本地摄像头 - Squat Checker (OpenCV)")
+
+with st.sidebar:
+    st.header("参数")
+    knee_th   = st.slider("膝关节阈值（°）", 60, 140, 100, 1)
+    show_heat = st.checkbox("显示热力图", True)
+    show_skel = st.checkbox("显示关键线", True)
+    alpha     = st.slider("热力图透明度", 0.0, 1.0, 0.45, 0.05)
+    target_w  = st.selectbox("分辨率宽", [640, 960, 1280], index=0)
+    fps_lmt   = st.slider("最大FPS", 5, 30, 15, 1)
+
+# ---- MP Pose 懒加载 ----
+_pose = None
+def get_pose():
+    global _pose
+    if _pose is None:
+        _pose = mp.solutions.pose.Pose(
+            static_image_mode=False, model_complexity=1,
+            enable_segmentation=False, min_detection_confidence=0.5,
+            min_tracking_confidence=0.5)
+    return _pose
+
+def angle_deg(a,b,c):
+    if a is None or b is None or c is None: return None
+    a,b,c = np.array(a,float), np.array(b,float), np.array(c,float)
+    ba, bc = a-b, c-b
+    nba, nbc = np.linalg.norm(ba)+1e-6, np.linalg.norm(bc)+1e-6
+    cosang = float(np.dot(ba,bc)/(nba*nbc)); cosang = max(-1,min(1,cosang))
+    return math.degrees(math.acos(cosang))
+
+def mp_landmarks_to_xy_list(res, W, H, vis_th=0.5):
+    pts = [None]*33
+    if res.pose_landmarks:
+        for i,lm in enumerate(res.pose_landmarks.landmark):
+            if lm.visibility is not None and lm.visibility < vis_th: continue
+            x, y = int(lm.x*W), int(lm.y*H)
+            pts[i]=(x,y)
+    return pts
+
+def squat_prob(points, th):
+    lh,lk,la = points[23], points[25], points[27]
+    rh,rk,ra = points[24], points[26], points[28]
+    lang, rang = angle_deg(lh,lk,la), angle_deg(rh,rk,ra)
+    scores=[]
+    for ang in (lang, rang):
+        if ang is None: continue
+        scores.append(max(0.0, (th-ang)/th))
+    return float(np.clip(np.mean(scores),0,1)) if scores else 0.0
+
+def banner(img, text, color=(30,144,255)):
+    H,W=img.shape[:2]; bar=max(36,H//18)
+    cv2.rectangle(img,(0,0),(W,bar),color,-1)
+    cv2.putText(img,text,(12,bar-10),cv2.FONT_HERSHEY_SIMPLEX,0.8,(255,255,255),2,cv2.LINE_AA)
+    return img
+
+col1, col2 = st.columns(2)
+start = col1.button("▶ 开始")
+stop  = col2.button("⏹ 停止")
+if start: st.session_state["run_cam"]=True
+if stop:  st.session_state["run_cam"]=False
+run = st.session_state.get("run_cam", False)
+
+placeholder = st.empty()
+status = st.empty()
+
+if run:
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # Windows 推荐 CAP_DSHOW
+    if not cap.isOpened():
+        st.error("无法打开摄像头")
+    else:
+        # 降分辨率提帧率
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  target_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(target_w*9/16))
+        pose = get_pose()
+        prev = 0
+        try:
+            while st.session_state.get("run_cam", False):
+                ret, img = cap.read()
+                if not ret: break
+                now = time.time()
+                if now - prev < 1.0/max(1,fps_lmt):
+                    time.sleep(0.001); continue
+                prev = now
+
+                rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                res = pose.process(rgb)
+                H,W = img.shape[:2]
+                pts  = mp_landmarks_to_xy_list(res, W, H, 0.5)
+                p = squat_prob(pts, knee_th)
+                label = "深蹲 ✅" if p>=0.5 else "非深蹲 ❌"
+                hint  = "动作良好，保持！" if p>=0.5 else "建议再下沉，并保持膝盖对齐脚尖。"
+
+                vis = img.copy()
+                if show_heat:
+                    heat = build_heatmap(vis.shape, pts, sigma=16, intensity=1.0)
+                    vis  = cv2.addWeighted(vis, 1-alpha, heat, alpha, 0.0)
+                if show_skel:
+                    sk = draw_skeleton_rgba(vis.shape, pts, thickness=3)
+                    vis = overlay_rgba_on_bgr(vis, sk)
+
+                color = (46,204,113) if p>=0.5 else (231,76,60)
+                vis   = banner(vis, f"{label} | squat:{p*100:.1f}% | {hint}", color)
+
+                placeholder.image(vis, channels="BGR", use_container_width=True)
+                status.info("按 ⏹ 停止")
+        finally:
+            cap.release()
+            status.empty()
+            st.rerun()
+else:
+    st.info("点击 **▶ 开始** 打开摄像头")
