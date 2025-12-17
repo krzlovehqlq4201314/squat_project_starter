@@ -1,153 +1,150 @@
-from __future__ import annotations
-import math
-import cv2
 import numpy as np
-import streamlit as st
+import cv2
 
+# 关键点可视化的骨架连线（YOLOv8-Pose / COCO-17）
 COCO_PAIRS = [
-    (5,7),(7,9),(6,8),(8,10),
-    (11,13),(13,15),(12,14),(14,16),
-    (5,6),(5,11),(6,12),(11,12),(0,5),(0,6)
+    (5,7),(7,9), (6,8),(8,10),
+    (11,13),(13,15), (12,14),(14,16),
+    (5,6),(5,11),(6,12),(11,12),
+    (0,5),(0,6)
 ]
+COCO = {
+    "nose":0,"l_eye":1,"r_eye":2,"l_ear":3,"r_ear":4,
+    "l_sho":5,"r_sho":6,"l_elb":7,"r_elb":8,"l_wri":9,"r_wri":10,
+    "l_hip":11,"r_hip":12,"l_knee":13,"r_knee":14,"l_ank":15,"r_ank":16
+}
 
-@st.cache_resource(show_spinner=False)
-def load_model():
-    from ultralytics import YOLO
-    return YOLO("yolov8n-pose.pt")
+# 阈值（可按需要微调）
+CONF_THR = 0.35              # 关键点置信度阈值
+FULLBODY_MIN_HEIGHT = 0.55   # 检测框高度/画面高度，保证尽量拍到全身
+KNEE_THR = 105.0             # <= 此角度 + 深度达标 => SQUAT
+
+def _get_xyc(kpt, idx):
+    """返回 (x,y,conf)，若缺失或低置信度 -> (nan,nan,0)"""
+    try:
+        x, y = kpt.xy[0, idx].tolist()
+        c = float(kpt.conf[0, idx].item())
+    except Exception:
+        return np.nan, np.nan, 0.0
+    if np.isnan(x) or np.isnan(y) or c < CONF_THR:
+        return np.nan, np.nan, 0.0
+    return float(x), float(y), c
 
 def _angle(a,b,c):
-    ba = np.array(a) - np.array(b)
-    bc = np.array(c) - np.array(b)
-    nba = np.linalg.norm(ba) + 1e-8
-    nbc = np.linalg.norm(bc) + 1e-8
-    cosang = float(np.dot(ba, bc) / (nba*nbc))
-    cosang = max(-1.0, min(1.0, cosang))
-    return math.degrees(math.acos(cosang))
+    """角ABC（度）。若任一点缺失则返回 nan"""
+    ax, ay, _ = a; bx, by, _ = b; cx, cy, _ = c
+    if any(np.isnan(v) for v in [ax,ay,bx,by,cx,cy]):
+        return np.nan
+    v1 = np.array([ax-bx, ay-by], dtype=float)
+    v2 = np.array([cx-bx, cy-by], dtype=float)
+    n1 = np.linalg.norm(v1); n2 = np.linalg.norm(v2)
+    if n1==0 or n2==0: return np.nan
+    cosang = np.clip(np.dot(v1,v2)/(n1*n2), -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosang)))
 
-def _draw_skeleton(img, kpt):
-    for i, j in COCO_PAIRS:
-        if i < len(kpt) and j < len(kpt):
-            xi, yi = kpt[i]
-            xj, yj = kpt[j]
-            if not (np.isnan(xi) or np.isnan(yi) or np.isnan(xj) or np.isnan(yj)):
-                cv2.line(img, (int(xi), int(yi)), (int(xj), int(yj)), (0,255,0), 2, cv2.LINE_AA)
-    for (x, y) in kpt:
-        if not (np.isnan(x) or np.isnan(y)):
-            cv2.circle(img, (int(x), int(y)), 3, (0,255,255), -1, cv2.LINE_AA)
-
-def _heatmap(h, w, kpt, sigma=18):
-    hm = np.zeros((h, w), np.float32)
-    yy, xx = np.mgrid[0:h, 0:w]
-    for (x, y) in kpt:
-        if np.isnan(x) or np.isnan(y): 
-            continue
-        g = np.exp(-((xx-x)**2 + (yy-y)**2) / (2*sigma*sigma))
-        hm = np.maximum(hm, g)
-    hm = (np.clip(hm, 0, 1) * 255).astype(np.uint8)
-    return cv2.applyColorMap(hm, cv2.COLORMAP_JET)
-
-def analyze(img_bgr: np.ndarray, draw_lines: bool=True, draw_heat: bool=True):
-    model = load_model()
-    results = model.predict(source=img_bgr, verbose=False, imgsz=640, device='cpu')
-    if not results or results[0].keypoints is None or len(results[0].keypoints.xy) == 0:
-        return img_bgr, "NOT SQUAT ❌ | No person detected. Ensure whole body is in frame."
-
-    k = results[0].keypoints.xy[0].cpu().numpy()
-    if k.shape[0] < 17:
-        pad = np.full((17-k.shape[0], 2), np.nan, dtype=np.float32)
-        k = np.concatenate([k, pad], axis=0)
-
-    H, W = img_bgr.shape[:2]
-    vis = img_bgr.copy()
-
-    nose   = k[0]
-    lsh, rsh = k[5], k[6]
-    lhip, rhip = k[11], k[12]
-    lknee, rknee = k[13], k[14]
-    lank,  rank  = k[15], k[16]
-
-    sh_mid  = np.nanmean(np.vstack([lsh, rsh]), axis=0)
-    hip_mid = np.nanmean(np.vstack([lhip, rhip]), axis=0)
-    knee_mid= np.nanmean(np.vstack([lknee, rknee]), axis=0)
-    ank_mid = np.nanmean(np.vstack([lank, rank]), axis=0)
-
-    def _safe(p): return not (np.isnan(p[0]) or np.isnan(p[1]))
-    def _side_depth_ok(hip,knee,tol): return _safe(hip) and _safe(knee) and (hip[1] > knee[1] - tol)
-
-    angles={}
-    if _safe(lhip) and _safe(lknee) and _safe(lank):
-        angles["knee_L"] = _angle(lhip, lknee, lank)
-    if _safe(rhip) and _safe(rknee) and _safe(rank):
-        angles["knee_R"] = _angle(rhip, rknee, rank)
-    knee_angle = np.nanmean([angles.get("knee_L", np.nan), angles.get("knee_R", np.nan)])
-
-    torso_lean = np.nan
-    if _safe(hip_mid) and _safe(sh_mid):
-        v = sh_mid - hip_mid
-        vertical = np.array([0, 1.0])
-        torso_lean = _angle(hip_mid + vertical, hip_mid, sh_mid)
-
-    tol = 0.02 * H
-    cand = []
-    if _safe(lhip) and _safe(lknee): cand.append(_side_depth_ok(lhip, lknee, tol))
-    if _safe(rhip) and _safe(rknee): cand.append(_side_depth_ok(rhip, rknee, tol))
-    if cand:
-        depth_ok = any(cand)
-    else:
-        depth_ok = _safe(hip_mid) and _safe(knee_mid) and (hip_mid[1] > knee_mid[1] - tol)
-
-    knee_track_ok = True
-    if _safe(lknee) and _safe(lank) and _safe(rknee) and _safe(rank) and _safe(lsh) and _safe(rsh):
-        shoulder_w = abs(rsh[0] - lsh[0]) + 1e-5
-        dev_L = abs(lknee[0] - lank[0]) / shoulder_w
-        dev_R = abs(rknee[0] - rank[0]) / shoulder_w
-        knee_track_ok = (dev_L < 0.25) and (dev_R < 0.25)
-
-    hip_angle = np.nan
-    if _safe(lsh) and _safe(lhip) and _safe(lknee):
-        hip_angle = _angle(lsh, lhip, lknee)
-    if _safe(rsh) and _safe(rhip) and _safe(rknee):
-        hip_angle = np.nanmean([hip_angle, _angle(rsh, rhip, rknee)])
-
-    # 阈值（和你当前一致/放宽）
-    ok_knee   = (not np.isnan(knee_angle)) and (80 <= knee_angle <= 120)
-    ok_torso  = (not np.isnan(torso_lean)) and (torso_lean <= 28)
-    ok_hipAng = (not np.isnan(hip_angle)) and (hip_angle <= 110)
-
-    passes = [ok_knee, depth_ok, ok_torso, knee_track_ok, ok_hipAng]
-    all_good = all(passes)
-
-    # —— 先做“Squat / Not Squat”总判定 —— 
-    # 定义：满足深度 + 膝角在区间 + 髋角关闭 视为 SQUAT；否则 NOT SQUAT
-    is_squat = depth_ok and ok_knee and ok_hipAng
-    prefix = "SQUAT ✅" if is_squat else "NOT SQUAT ❌"
-
-    # 生成信息
-    tips_good, tips_fix = [], []
-    if ok_knee:   tips_good.append(f"Knee angle {int(round(knee_angle))}° ✅")
-    else:         tips_fix.append("Aim knees around 90° (±30° allowed).")
-    if depth_ok:  tips_good.append("Depth OK ✅")
-    else:         tips_fix.append("Go deeper: hip below knee at bottom (2% tolerance).")
-    if ok_torso:  tips_good.append(f"Torso lean {int(round(torso_lean))}° ✅")
-    else:         tips_fix.append("Keep chest up; reduce torso lean (<28°).")
-    if knee_track_ok: tips_good.append("Knees track toes ✅")
-    else:             tips_fix.append("Push knees out over toes (tracking).")
-    if ok_hipAng: tips_good.append("Hips closed ✅")
-    else:         tips_fix.append("Close hips more on descent.")
-
-    if draw_lines: _draw_skeleton(vis, k)
+def _draw_overlay(img, kpt, draw_lines=True, draw_heat=True):
+    """简单骨架+热力点可视化"""
+    vis = img.copy()
+    # 热力点
     if draw_heat:
-        hm = _heatmap(*vis.shape[:2], k)
-        vis = cv2.addWeighted(vis, 0.65, hm, 0.35, 0)
+        heat = np.zeros_like(vis)
+        for i in range(17):
+            try:
+                x, y = kpt.xy[0, i].astype(int).tolist()
+                c = float(kpt.conf[0, i].item())
+            except Exception:
+                continue
+            if c < CONF_THR: 
+                continue
+            cv2.circle(heat, (x,y), 10, (0,0,255), -1)
+        heat = cv2.GaussianBlur(heat, (0,0), 7)
+        vis = cv2.addWeighted(vis, 0.7, heat, 0.3, 0.0)
+    # 骨架线
+    if draw_lines:
+        for i,j in COCO_PAIRS:
+            try:
+                xi, yi = kpt.xy[0, i].astype(int).tolist()
+                xj, yj = kpt.xy[0, j].astype(int).tolist()
+                ci = float(kpt.conf[0, i].item()); cj = float(kpt.conf[0, j].item())
+            except Exception:
+                continue
+            if ci>=CONF_THR and cj>=CONF_THR:
+                cv2.line(vis, (xi,yi), (xj,yj), (0,255,0), 2, cv2.LINE_AA)
+        for i in range(17):
+            try:
+                x, y = kpt.xy[0, i].astype(int).tolist()
+                c = float(kpt.conf[0, i].item())
+            except Exception:
+                continue
+            if c>=CONF_THR:
+                cv2.circle(vis, (x,y), 4, (0,255,255), -1, cv2.LINE_AA)
+    return vis
 
-    if is_squat and all_good:
-        msg = f"{prefix} | " + " | ".join(tips_good)
-    elif is_squat:
-        msg = f"{prefix} | " + " | ".join(tips_good) + ("  | Tips: " + " | ".join(tips_fix) if tips_fix else "")
-    else:
-        # NOT SQUAT 时优先给出关键修正
-        core = " | ".join(tips_fix) if tips_fix else "Form issues detected."
-        extra= " | ".join(tips_good) if tips_good else ""
-        msg = f"{prefix} | {core}" + (f"  | Ref: {extra}" if extra else "")
+def analyze(image_bgr, model, draw_lines=True, draw_heat=True):
+    """
+    统一给“上传图片”与“Webcam Stable”调用。
+    缺腿部关键点/不全身 -> 直接 NOT SQUAT + 提示。
+    满足条件时计算膝角与深度再判定。
+    """
+    h, w = image_bgr.shape[:2]
+    results = model.predict(source=image_bgr, verbose=False, imgsz=640, device="cpu")
+    if not results or len(results[0].keypoints)==0:
+        return image_bgr, "[NOT SQUAT] No person detected. Please include the full body."
 
+    kpt = results[0].keypoints   # (1,17,2) + conf
+    # 全身入镜：用第一个检测框判断高度占比
+    fullbody_ok = True
+    try:
+        box = results[0].boxes.xyxy[0].cpu().numpy()
+        x1,y1,x2,y2 = box
+        fullbody_ok = ((y2 - y1) / h) >= FULLBODY_MIN_HEIGHT
+    except Exception:
+        pass
+
+    # 取左右髋/膝/踝
+    l_hip = _get_xyc(kpt, COCO["l_hip"])
+    r_hip = _get_xyc(kpt, COCO["r_hip"])
+    l_knee = _get_xyc(kpt, COCO["l_knee"])
+    r_knee = _get_xyc(kpt, COCO["r_knee"])
+    l_ank = _get_xyc(kpt, COCO["l_ank"])
+    r_ank = _get_xyc(kpt, COCO["r_ank"])
+
+    left_ok  = l_hip[2]>=CONF_THR and l_knee[2]>=CONF_THR and l_ank[2]>=CONF_THR
+    right_ok = r_hip[2]>=CONF_THR and r_knee[2]>=CONF_THR and r_ank[2]>=CONF_THR
+    have_legs = left_ok or right_ok
+
+    vis = _draw_overlay(image_bgr, kpt, draw_lines, draw_heat)
+
+    # 关键点不全/非全身：直接 NOT SQUAT
+    if (not have_legs) or (not fullbody_ok):
+        tips = "Please show hips/knees/ankles (full body). Move back a little."
+        return vis, f"[NOT SQUAT] Missing lower-body keypoints. {tips}"
+
+    # 计算膝角（左右取均值）
+    angL = _angle(l_hip, l_knee, l_ank) if left_ok else np.nan
+    angR = _angle(r_hip, r_knee, r_ank) if right_ok else np.nan
+    valid = [a for a in [angL, angR] if not np.isnan(a)]
+    knee_angle = float(np.mean(valid)) if valid else np.nan
+
+    # 深度：髋在膝之下视为达标（y向下为正）
+    depth_ok = False
+    if left_ok and not np.isnan(l_hip[1]) and not np.isnan(l_knee[1]):
+        depth_ok |= (l_hip[1] > l_knee[1] * 0.98)
+    if right_ok and not np.isnan(r_hip[1]) and not np.isnan(r_knee[1]):
+        depth_ok |= (r_hip[1] > r_knee[1] * 0.98)
+
+    valid_angle = not np.isnan(knee_angle)
+    is_squat = valid_angle and (knee_angle <= KNEE_THR) and depth_ok
+
+    status = "SQUAT ✅" if is_squat else "NOT SQUAT ❌"
+    angle_text = f"Knee angle {knee_angle:.0f}°" if valid_angle else "Knee angle N/A"
+    depth_text = "Depth OK" if depth_ok else "Depth too shallow"
+    msg = f"{status} | {angle_text} | {depth_text}"
+
+    tips = []
+    if not depth_ok:
+        tips.append("Go deeper (hip below knee at bottom).")
+    if valid_angle and knee_angle > KNEE_THR:
+        tips.append("Bend knees more (reduce knee angle).")
+    if tips: msg += " | Tips: " + " ".join(tips)
     return vis, msg
