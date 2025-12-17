@@ -18,3 +18,10 @@ data/*
 .DS_Store
 .vscode/
 .idea/
+# local artifacts
+runs/
+data/datasets/
+*.cache
+.vscode/
+.venv*/
+__pycache__/
