@@ -1,20 +1,21 @@
-# venv
+.venv/
 .venv*/
-.venv*/
-.venv311/
-# python
+venv/
+env/
 __pycache__/
-*.pyc
-# streamlit
-.streamlit/secrets.toml
-# models & weights
-models/*.pt
-models/*.onnx
-checkpoints/
-# data
-data/*
-!data/README.md
-# OS / IDE
+*.py[cod]
+*.ipynb_checkpoints
+dist/
+build/
+*.egg-info/
+*.bak
+*backup*/
+app_backup_*/
+backup_*/
+*.bak.*
+*.tmp
 .DS_Store
-.vscode/
-.idea/
+Thumbs.db
+# 如需把压缩包提交，注释下面两行
+*.zip
+*.tar.gz

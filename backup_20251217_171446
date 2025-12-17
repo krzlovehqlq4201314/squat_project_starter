@@ -1,0 +1,20 @@
+import streamlit as st
+import numpy as np, cv2
+from utils.pose import load_model, analyze
+
+st.set_page_config(page_title="Webcam Stable", layout="wide")
+
+if "pose_model" not in st.session_state:
+    st.session_state.pose_model = load_model()
+model = st.session_state.pose_model
+
+draw_lines = st.checkbox("Draw skeleton lines", value=True)
+draw_heat  = st.checkbox("Draw heatmap", value=False)
+
+photo = st.camera_input("Take a photo")
+if photo is not None:
+    data = np.frombuffer(photo.getvalue(), np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    vis, msg = analyze(img, model, draw_lines=draw_lines, draw_heat=draw_heat)
+    st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption="snapshot.jpg", use_container_width=True)
+    st.info(msg)

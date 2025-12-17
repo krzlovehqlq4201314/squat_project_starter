@@ -1,0 +1,215 @@
+from __future__ import annotations
+import cv2
+import numpy as np
+import streamlit as st
+from ultralytics import YOLO
+
+# 与 YOLOv8-Pose(17关键点)匹配的 COCO 连接对
+COCO_PAIRS = [
+    (5, 7), (7, 9),        # left arm
+    (6, 8), (8, 10),       # right arm
+    (11, 13), (13, 15),    # left leg
+    (12, 14), (14, 16),    # right leg
+    (5, 6), (5, 11), (6, 12), (11, 12),  # shoulders-hips box
+    (0, 5), (0, 6)         # head to shoulders
+]
+
+# —— 新阈值：更贴近你现在的样例 —— #
+SQUAT_KNEE_MAX_DEG = 100   # 之前是 95°
+HIP_BELOW_MARGIN_PX = 6     # 髋要比膝“再低”一点点，防抖判断
+
+@st.cache_resource(show_spinner=False)
+def load_model():
+    """懒加载 YOLOv8 Pose，小模型即可。"""
+    return YOLO("yolov8n-pose.pt")
+
+def _draw_skeleton(img: np.ndarray, kpts: list[tuple], pairs=COCO_PAIRS,
+                   color=(0, 255, 0), thickness=2):
+    for (i, j) in pairs:
+        if i < len(kpts) and j < len(kpts):
+            xi, yi, ci = kpts[i]
+            xj, yj, cj = kpts[j]
+            if ci > 0 and cj > 0:
+                cv2.line(img, (int(xi), int(yi)), (int(xj), int(yj)), color, thickness)
+                cv2.circle(img, (int(xi), int(yi)), 3, (0, 255, 255), -1)
+                cv2.circle(img, (int(xj), int(yj)), 3, (0, 255, 255), -1)
+
+def _heat_overlay(img: np.ndarray, kpts: list[tuple]) -> np.ndarray:
+    heat = np.zeros(img.shape[:2], dtype=np.float32)
+    for (x, y, c) in kpts:
+        if c > 0:
+            cv2.circle(heat, (int(x), int(y)), 20, 1.0, -1)
+    heat = cv2.GaussianBlur(heat, (0, 0), sigmaX=15, sigmaY=15)
+    heat = np.clip(heat, 0, 1)
+    heat_color = cv2.applyColorMap((heat * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    out = cv2.addWeighted(img, 0.6, heat_color, 0.4, 0)
+    return out
+
+def _angle(a, b, c):
+    # 角度 ∠ABC（a-b-c）
+    BA = np.array([a[0]-b[0], a[1]-b[1]], dtype=float)
+    BC = np.array([c[0]-b[0], c[1]-b[1]], dtype=float)
+    if np.linalg.norm(BA) == 0 or np.linalg.norm(BC) == 0:
+        return None
+    cosang = np.dot(BA, BC) / (np.linalg.norm(BA) * np.linalg.norm(BC))
+    cosang = np.clip(cosang, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cosang)))
+
+def analyze(image_bgr: np.ndarray, model=None,
+            draw_lines: bool = True, draw_heat: bool = True):
+    """
+    返回 (可视化图像BGR, 文本消息)。model 可省略；省略时自动懒加载。
+    """
+    if model is None:
+        model = load_model()
+
+    # YOLO 直接吃 ndarray 即可
+    results = model.predict(source=image_bgr, verbose=False)
+    kpts = None
+    if results and len(results) > 0:
+        r = results[0]
+        if getattr(r, "keypoints", None) is not None and len(r.keypoints) > 0:
+            k = r.keypoints.xy[0].cpu().numpy()           # (17,2)
+            if getattr(r.keypoints, "conf", None) is not None:
+                c = r.keypoints.conf[0].cpu().numpy()
+            else:
+                c = np.ones((k.shape[0],), dtype=float)
+            kpts = [(float(k[i, 0]), float(k[i, 1]), float(c[i])) for i in range(k.shape[0])]
+
+    vis = image_bgr.copy()
+    if kpts is None:
+        return vis, "No person detected."
+
+    if draw_heat:
+        vis = _heat_overlay(vis, kpts)
+    if draw_lines:
+        _draw_skeleton(vis, kpts, COCO_PAIRS)
+
+    def pt(idx):
+        if idx < len(kpts):
+            return (kpts[idx][0], kpts[idx][1])
+        return None
+
+    def ang(i, j, k):
+        a, b, c = pt(i), pt(j), pt(k)
+        if a is None or b is None or c is None:
+            return None
+        return _angle(a, b, c)
+
+    # 两膝角度（左：11-13-15，右：12-14-16）
+    kneeL = ang(11, 13, 15)
+    kneeR = ang(12, 14, 16)
+    knees = [x for x in (kneeL, kneeR) if x is not None]
+    knee = float(np.nanmean(knees)) if knees else None
+
+    # 髋是否低于膝（任意一侧满足即可）
+    hipL, hipR = pt(11), pt(12)
+    kneeLP, kneeRP = pt(13), pt(14)
+    hip_below_L = (hipL and kneeLP and hipL[1] >= kneeLP[1] + HIP_BELOW_MARGIN_PX)
+    hip_below_R = (hipR and kneeRP and hipR[1] >= kneeRP[1] + HIP_BELOW_MARGIN_PX)
+    hip_below = bool(hip_below_L or hip_below_R)
+
+    decision = "NOT SQUAT"
+    tips = []
+    if knee is None:
+        tips.append("Stand back / fit legs into frame")
+    else:
+        if (knee <= SQUAT_KNEE_MAX_DEG) and hip_below:
+            decision = "SQUAT"
+        else:
+            if knee > SQUAT_KNEE_MAX_DEG:
+                tips.append(f"Go deeper: knee angle ≤ {SQUAT_KNEE_MAX_DEG}°")
+            if not hip_below:
+                tips.append("Sink hips below knees")
+
+    # 文案
+    msg = f"{decision} | Knee angle {int(knee) if knee is not None else 'NA'}° | "
+    msg += ("Depth OK" if hip_below else "Go deeper: hip below knee")
+    if tips:
+        msg += " | " + " | ".join(tips)
+    return vis, msg
+# --- begin: robust squat classifier (v1) ---
+import numpy as np
+KNEE_ANGLE_THR = 110          # 膝角放宽，图片更稳
+TORSO_LEAN_THR = 40           # 躯干前倾最大
+DEPTH_MARGIN_NORM = 0.06      # 髋需低于膝（按图高）
+MIN_VISIBLE_LEG_PIX = 0.15    # 必须看到足够多的下肢（防只拍上半身）
+KNEE_TO_TOE_NORM = 0.12       # 膝/脚尖同向容差（防膝内扣）
+
+def _angle(a,b,c):
+    ba=a-b; bc=c-b
+    if np.linalg.norm(ba)<1e-6 or np.linalg.norm(bc)<1e-6: return 180.0
+    cosang=np.dot(ba,bc)/(np.linalg.norm(ba)*np.linalg.norm(bc)+1e-6)
+    cosang=np.clip(cosang,-1.0,1.0)
+    return float(np.degrees(np.arccos(cosang)))
+
+def _ok(conf, ids, thr=0.25):
+    import numpy as _np
+    return _np.all(conf[ids] > thr)
+
+def classify_squat_yolo17(kpts_xyc, H, W):
+    xy=kpts_xyc[:,:2].astype(float); cf=kpts_xyc[:,2].astype(float)
+    L_HIP,L_KNEE,L_ANK = 11,13,15
+    R_HIP,R_KNEE,R_ANK = 12,14,16
+    L_SH,R_SH = 5,6
+
+    tips=[]
+    # —— 看不见腿/脚：直接 NOT SQUAT（防上半身误判）
+    leg_ids=[L_KNEE,L_ANK,R_KNEE,R_ANK]
+    if (cf[leg_ids] > 0.25).sum() < 2:
+        return False, {"reason":"legs_not_visible","tips":["下半身关键点不足，无法判定"],
+                       "knee_angle":None,"depth_ok":False,"knees_track":False}
+
+    # —— 至少有一条腿膝-踝竖直跨度达标（画面别只到上半身）
+    leg_spans=[]
+    for hip,knee,ank in [(L_HIP,L_KNEE,L_ANK),(R_HIP,R_KNEE,R_ANK)]:
+        if _ok(cf,[knee,ank]): leg_spans.append(abs(xy[knee,1]-xy[ank,1]))
+    if not leg_spans or max(leg_spans) < MIN_VISIBLE_LEG_PIX*H:
+        return False, {"reason":"legs_too_small","tips":["镜头太近或画面只到上半身"],
+                       "knee_angle":None,"depth_ok":False,"knees_track":False}
+
+    # —— 两条腿取“更像深蹲”的一边
+    knee_angles=[]; depth_flags=[]
+    for hip,knee,ank in [(L_HIP,L_KNEE,L_ANK),(R_HIP,R_KNEE,R_ANK)]:
+        if _ok(cf,[hip,knee,ank]):
+            knee_angles.append(_angle(xy[hip],xy[knee],xy[ank]))
+            depth_flags.append(xy[hip,1] > xy[knee,1] + DEPTH_MARGIN_NORM*H)
+
+    if not knee_angles:
+        return False, {"reason":"no_complete_leg","tips":["未同时检测到髋-膝-踝"],
+                       "knee_angle":None,"depth_ok":False,"knees_track":False}
+
+    knee_angle=float(min(knee_angles))
+    depth_ok=bool(np.any(depth_flags))
+
+    # —— 躯干前倾角（肩-髋连线相对竖直）
+    torso_angle=0.0
+    if _ok(cf,[L_SH,R_SH,L_HIP,R_HIP]):
+        mid_sh=xy[[L_SH,R_SH]].mean(axis=0); mid_hp=xy[[L_HIP,R_HIP]].mean(axis=0)
+        v=mid_sh-mid_hp
+        torso_angle=abs(90.0 - float(np.degrees(np.arctan2(v[1],v[0]))))
+
+    # —— 膝盖跟脚尖同向（x 方向一致性）
+    knees_track=True
+    if _ok(cf,[L_KNEE,L_ANK]) or _ok(cf,[R_KNEE,R_ANK]):
+        xs_knee=[]; xs_toe=[]
+        if _ok(cf,[L_KNEE,L_ANK]): xs_knee.append(xy[L_KNEE,0]); xs_toe.append(xy[L_ANK,0])
+        if _ok(cf,[R_KNEE,R_ANK]): xs_knee.append(xy[R_KNEE,0]); xs_toe.append(xy[R_ANK,0])
+        knees_track = abs(np.mean(xs_knee)-np.mean(xs_toe)) <= KNEE_TO_TOE_NORM*W
+
+    is_squat = (knee_angle <= KNEE_ANGLE_THR) and depth_ok and (torso_angle <= TORSO_LEAN_THR)
+
+    tips = []
+    if not depth_ok: tips.append("Go deeper: hip below knee")
+    if knee_angle > KNEE_ANGLE_THR: tips.append(f"Reduce knee_angle (now {int(round(knee_angle))}°)")
+    if torso_angle > TORSO_LEAN_THR: tips.append("Keep chest up; reduce torso lean")
+    if not knees_track: tips.append("Push knees out over toes (tracking)")
+
+    return is_squat, {
+        "knee_angle": round(knee_angle,1),
+        "depth_ok": bool(depth_ok),
+        "knees_track": bool(knees_track),
+        "torso_lean": round(float(torso_angle),1),
+        "tips": tips
+    }
+# --- end: robust squat classifier ---
