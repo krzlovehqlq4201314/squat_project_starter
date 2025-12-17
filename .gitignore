@@ -1,29 +1,21 @@
-# virtualenv
 .venv/
 .venv*/
 venv/
 env/
-.venv311/
-
-# python cache
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-
-# build artifacts
+*.ipynb_checkpoints
 dist/
 build/
 *.egg-info/
-
-# backups / temp
 *.bak
-*.bak.*
 *backup*/
 app_backup_*/
 backup_*/
+*.bak.*
 *.tmp
-
-# OS junk
 .DS_Store
 Thumbs.db
+# 如需把压缩包提交，注释下面两行
+*.zip
+*.tar.gz
